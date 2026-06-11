@@ -143,8 +143,8 @@ try {
         Write-Log "OK | PID=$PID | NtSetTimerResolution succeeded | NtQueryTimerResolution failed: 0x$($qStatus.ToString('X8'))"
     }
 
-    # Keep process alive  Sleep loop  Scheduled Task 
     # Keep process alive - Sleep loop is best for this Scheduled Task pattern
+    while ($true) {
         Start-Sleep -Seconds 3600
     }
 }
@@ -379,8 +379,8 @@ function Uninstall-Task {
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
         try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
 
-        # FIX: poll  task  remove  ( file lock)
         # FIX: poll until task stops before removing files (prevent file lock)
+        for ($i = 0; $i -lt 10; $i++) {
             $state = (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).State
             if ($state -ne "Running") { break }
             Start-Sleep -Seconds 1
