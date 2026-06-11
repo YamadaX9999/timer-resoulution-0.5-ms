@@ -1,75 +1,73 @@
-#requires -Version 5.1
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
+# =====================================================
+# SYSTEM Timer Resolution 0.5ms
+# Version 3.0 - Menu Edition
+# Menu: 1) Install  2) Status  3) Uninstall  4) Exit
+# =====================================================
 
-$InstallDir = "C:\LowLatency"
-$TaskName    = "SYSTEM_Timer_Resolution_0.5ms"
-$WorkerPath  = Join-Path $InstallDir "TimerResolutionWorker.ps1"
-$LogPath     = Join-Path $InstallDir "timer.log"
-
-function Test-Admin {
-    return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).
-        IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "[ ERR ] Please run PowerShell as Administrator" -ForegroundColor Red
+    exit 1
 }
 
-function Ensure-InstallDir {
-    if (-not (Test-Path $InstallDir)) {
-        New-Item -ItemType Directory -Path $InstallDir | Out-Null
-    }
+$BaseDir  = "C:\LowLatency"
+$Script   = "$BaseDir\TimerResolution.ps1"
+$TaskName = "SYSTEM_Timer_Resolution_0.5ms"
+$LogPath  = "$BaseDir\timer.log"
+
+# -- UI helpers --
+
+function Write-Line {
+    param([string]$Text = "", [ConsoleColor]$Color = [ConsoleColor]::Gray)
+    Write-Host $Text -ForegroundColor $Color
 }
 
-function Write-Title([string]$Text) {
+function Draw-Frame {
+    param([string]$Title)
     Clear-Host
-    Write-Host "+------------------------------------------------------------------------+" -ForegroundColor DarkCyan
-    Write-Host ("| {0,-70} |" -f $Text) -ForegroundColor Cyan
-    Write-Host "+------------------------------------------------------------------------+" -ForegroundColor DarkCyan
+    Write-Host "+------------------------------------------------------------------+" -ForegroundColor DarkCyan
+    Write-Host ("| {0,-64} |" -f $Title) -ForegroundColor Cyan
+    Write-Host "+------------------------------------------------------------------+" -ForegroundColor DarkCyan
 }
 
-function Write-Section([string]$Text) {
-    Write-Host ""
-    Write-Host $Text -ForegroundColor Cyan
-    Write-Host ("-" * 72) -ForegroundColor DarkCyan
+function Draw-Menu {
+    param([string]$Selected = "")
+
+    Draw-Frame "SYSTEM Timer Resolution 0.5ms"
+    Write-Line ""
+    Write-Line "  Select an option:" DarkGray
+    Write-Line ""
+
+    $items = @(
+        @{ Key = "1"; Text = "Install and Start";  Color = [ConsoleColor]::DarkGreen },
+        @{ Key = "2"; Text = "Check Status";        Color = [ConsoleColor]::DarkCyan  },
+        @{ Key = "3"; Text = "Uninstall";           Color = [ConsoleColor]::DarkRed   },
+        @{ Key = "4"; Text = "Exit";                Color = [ConsoleColor]::DarkGray  }
+    )
+
+    foreach ($item in $items) {
+        if ($Selected -eq $item.Key) {
+            Write-Host "  => " -NoNewline -ForegroundColor Yellow
+            Write-Host "[ $($item.Key) ]" -NoNewline -ForegroundColor Black -BackgroundColor Yellow
+            Write-Host "  $($item.Text)" -ForegroundColor Yellow
+        } else {
+            Write-Host "     [ " -NoNewline -ForegroundColor DarkGray
+            Write-Host $item.Key -NoNewline -ForegroundColor Black -BackgroundColor $item.Color
+            Write-Host " ]  " -NoNewline -ForegroundColor DarkGray
+            Write-Host $item.Text -ForegroundColor $item.Color
+        }
+    }
+
+    Write-Line ""
 }
 
-function Write-Info([string]$Text)  { Write-Host $Text -ForegroundColor White }
-function Write-Ok([string]$Text)    { Write-Host $Text -ForegroundColor Green }
-function Write-Warn([string]$Text)  { Write-Host $Text -ForegroundColor Yellow }
-function Write-Bad([string]$Text)   { Write-Host $Text -ForegroundColor Red }
-
-function Pause-Menu {
-    [void](Read-Host "กด Enter เพื่อกลับเมนู")
-}
-
-function Format-Ms([uint32]$Ticks) {
-    [math]::Round($Ticks / 10000.0, 4)
-}
-
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-
-public static class TimerQueryNative
-{
-    [DllImport("ntdll.dll")]
-    public static extern int NtQueryTimerResolution(
-        out uint MinimumResolution,
-        out uint MaximumResolution,
-        out uint CurrentResolution
-    );
-}
-"@
+# -- Worker script content --
 
 $WorkerScript = @'
-#requires -Version 5.1
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 
-public static class TimerWorkerNative
-{
+public class TimerResolution {
     [DllImport("ntdll.dll")]
     public static extern int NtSetTimerResolution(
         uint DesiredResolution,
@@ -86,344 +84,313 @@ public static class TimerWorkerNative
 }
 "@
 
-$BaseDir = "C:\LowLatency"
-$LogPath = Join-Path $BaseDir "timer.log"
+$logPath = "C:\LowLatency\timer.log"
 
 function Write-Log {
-    param([Parameter(Mandatory)][string]$Message)
-    $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "[$stamp] $Message"
-    Add-Content -Path $LogPath -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
+    param([string]$msg)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "[$ts] $msg" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
 }
 
-function Convert-ToMs([uint32]$Ticks) {
-    [math]::Round($Ticks / 10000.0, 4)
+function Get-ResolutionMs {
+    param([uint32]$ticks)
+    [math]::Round($ticks / 10000.0, 4)
 }
 
-try {
-    if (-not (Test-Path $BaseDir)) {
-        New-Item -ItemType Directory -Path $BaseDir | Out-Null
+Write-Log "=== Worker started | PID=$PID ==="
+
+# Initial set with retry
+$maxRetry = 5
+$attempt  = 0
+$success  = $false
+
+while (-not $success -and $attempt -lt $maxRetry) {
+    $attempt++
+    [uint32]$current = 0
+    $result = [TimerResolution]::NtSetTimerResolution(5000, $true, [ref]$current)
+
+    if ($result -eq 0) {
+        # Query actual system resolution to verify
+        [uint32]$min = 0; [uint32]$max = 0; [uint32]$now = 0
+        $qr = [TimerResolution]::NtQueryTimerResolution([ref]$min, [ref]$max, [ref]$now)
+
+        if ($qr -eq 0) {
+            Write-Log "OK | PID=$PID | Attempt=$attempt | Set=$(Get-ResolutionMs $current)ms | System=$(Get-ResolutionMs $now)ms | Min=$(Get-ResolutionMs $min)ms"
+        } else {
+            Write-Log "OK | PID=$PID | Attempt=$attempt | Set=$(Get-ResolutionMs $current)ms | NtQuery failed=0x$($qr.ToString('X8'))"
+        }
+        $success = $true
+    } else {
+        Write-Log "FAIL | Attempt=$attempt | NTSTATUS=0x$($result.ToString('X8')) | Retrying in 5s..."
+        Start-Sleep -Seconds 5
     }
+}
 
-    Write-Log "START | PID=$PID | Worker launching"
+if (-not $success) {
+    Write-Log "FATAL | PID=$PID | Failed after $maxRetry attempts. Exiting."
+    exit 1
+}
+
+# Keep-alive loop: re-apply every 30s + heartbeat log every 60 loops (30min)
+$loopCount = 0
+while ($true) {
+    Start-Sleep -Seconds 30
+    $loopCount++
 
     [uint32]$current = 0
-    $status = [TimerWorkerNative]::NtSetTimerResolution(5000, $true, [ref]$current)
+    $result = [TimerResolution]::NtSetTimerResolution(5000, $true, [ref]$current)
 
-    if ($status -ne 0) {
-        throw "NtSetTimerResolution failed: NTSTATUS=0x$($status.ToString('X8'))"
+    if ($result -ne 0) {
+        Write-Log "WARN | PID=$PID | Re-apply failed | NTSTATUS=0x$($result.ToString('X8'))"
+    } elseif ($loopCount % 60 -eq 0) {
+        # Heartbeat every 30 minutes
+        [uint32]$min = 0; [uint32]$max = 0; [uint32]$now = 0
+        [TimerResolution]::NtQueryTimerResolution([ref]$min, [ref]$max, [ref]$now) | Out-Null
+        Write-Log "HEARTBEAT | PID=$PID | System=$(Get-ResolutionMs $now)ms | Uploop=$loopCount"
     }
-
-    [uint32]$min = 0
-    [uint32]$max = 0
-    [uint32]$now = 0
-    $q = [TimerWorkerNative]::NtQueryTimerResolution([ref]$min, [ref]$max, [ref]$now)
-
-    if ($q -eq 0) {
-        Write-Log "OK | PID=$PID | Current=$(Convert-ToMs $now)ms | Min=$(Convert-ToMs $min)ms | Max=$(Convert-ToMs $max)ms"
-    }
-    else {
-        Write-Log "OK | PID=$PID | NtSetTimerResolution succeeded | NtQueryTimerResolution failed: 0x$($q.ToString('X8'))"
-    }
-
-    while ($true) {
-        Start-Sleep -Seconds 3600
-    }
-}
-catch {
-    Write-Log "FATAL | PID=$PID | $($_.Exception.Message)"
-    exit 1
 }
 '@
 
+# -- NtQuery helper for Status page --
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public class TimerQuery {
+    [DllImport("ntdll.dll")]
+    public static extern int NtQueryTimerResolution(
+        out uint MinimumResolution,
+        out uint MaximumResolution,
+        out uint CurrentResolution
+    );
+}
+"@ -ErrorAction SilentlyContinue
+
 function Get-SystemTimerMs {
     try {
-        [uint32]$min = 0
-        [uint32]$max = 0
-        [uint32]$now = 0
-        $status = [TimerQueryNative]::NtQueryTimerResolution([ref]$min, [ref]$max, [ref]$now)
-        if ($status -eq 0) {
-            return [math]::Round($now / 10000.0, 4)
-        }
-    }
-    catch {
+        [uint32]$min = 0; [uint32]$max = 0; [uint32]$now = 0
+        $r = [TimerQuery]::NtQueryTimerResolution([ref]$min, [ref]$max, [ref]$now)
+        if ($r -eq 0) { return [math]::Round($now / 10000.0, 4) }
+    } catch {}
+    return $null
+}
+
+function Get-WorkerPid {
+    if (-not (Test-Path $LogPath)) { return $null }
+    $line = Get-Content $LogPath -Tail 100 |
+            Select-String "PID=(\d+)" |
+            Select-Object -Last 1
+    if ($line -and $line.Matches.Groups[1].Value) {
+        return [int]$line.Matches.Groups[1].Value
     }
     return $null
 }
 
-function Get-WorkerPidFromLog {
-    if (-not (Test-Path $LogPath)) {
-        return $null
-    }
-
-    $match = Get-Content -Path $LogPath -Tail 100 -ErrorAction SilentlyContinue |
-        Select-String -Pattern 'PID=(\d+)' |
-        Select-Object -Last 1
-
-    if ($null -ne $match -and $match.Matches.Count -gt 0) {
-        $pidText = $match.Matches[0].Groups[1].Value
-        if (-not [string]::IsNullOrWhiteSpace($pidText)) {
-            return [int]$pidText
-        }
-    }
-
-    return $null
-}
-
-function Get-WorkerAlive {
-    $pid = Get-WorkerPidFromLog
-    if ($null -eq $pid) {
-        return $false
-    }
-
-    return [bool](Get-Process -Id $pid -ErrorAction SilentlyContinue)
-}
-
-function Get-OverallStatus {
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    $taskRunning = $false
-    if ($task) {
-        $taskRunning = ($task.State -eq "Running")
-    }
-
-    $workerAlive = $false
-    if ($taskRunning) {
-        $workerAlive = Get-WorkerAlive
-    }
-
-    $systemMs = Get-SystemTimerMs
-    $isLow = ($null -ne $systemMs -and $systemMs -le 0.5)
-
-    if ($workerAlive -and $isLow) {
-        return [pscustomobject]@{ Status = "ACTIVE"; SystemMs = $systemMs; WorkerAlive = $true; TaskRunning = $true }
-    }
-
-    if ($workerAlive -and -not $isLow) {
-        return [pscustomobject]@{ Status = "DEGRADED"; SystemMs = $systemMs; WorkerAlive = $true; TaskRunning = $true }
-    }
-
-    if (-not $workerAlive -and $isLow) {
-        return [pscustomobject]@{ Status = "EXTERNAL SOURCE"; SystemMs = $systemMs; WorkerAlive = $false; TaskRunning = $taskRunning }
-    }
-
-    return [pscustomobject]@{ Status = "NOT RUNNING"; SystemMs = $systemMs; WorkerAlive = $false; TaskRunning = $taskRunning }
-}
+# -- Install --
 
 function Install-Task {
-    Ensure-InstallDir
+    Draw-Frame "Installing..."
+    Write-Line ""
 
-    Set-Content -Path $WorkerPath -Value $WorkerScript -Encoding UTF8
-
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        try {
-            Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        }
-        catch {
-        }
-
-        for ($i = 0; $i -lt 10; $i++) {
-            $state = (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).State
-            if ($state -ne "Running") {
-                break
-            }
-            Start-Sleep -Milliseconds 500
-        }
-
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    if (!(Test-Path $BaseDir)) {
+        New-Item -ItemType Directory -Path $BaseDir | Out-Null
+        Write-Line "  [+] Created directory: $BaseDir" Cyan
     }
 
-    $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$WorkerPath`""
-    $trigger = New-ScheduledTaskTrigger -AtStartup
-    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1)
+    Set-Content -Path $Script -Value $WorkerScript -Encoding UTF8
+    Write-Line "  [+] Worker script written" Cyan
 
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask $TaskName -Confirm:$false
+        Write-Line "  [+] Removed old task" Cyan
+    }
 
+    $Action = New-ScheduledTaskAction `
+        -Execute "powershell.exe" `
+        -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Script`""
+
+    $Trigger   = New-ScheduledTaskTrigger -AtStartup
+    $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $Settings  = New-ScheduledTaskSettingsSet `
+        -Hidden -StartWhenAvailable `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1)
+
+    Register-ScheduledTask `
+        -TaskName $TaskName -Action $Action -Trigger $Trigger `
+        -Principal $Principal -Settings $Settings | Out-Null
+
+    Write-Line "  [+] Scheduled Task registered" Cyan
+
+    # Poll until task exists before starting
     $ready = $false
     for ($i = 0; $i -lt 10; $i++) {
         if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-            $ready = $true
-            break
+            $ready = $true; break
         }
         Start-Sleep -Milliseconds 500
     }
 
     if (-not $ready) {
-        throw "Register-ScheduledTask timed out"
+        Write-Line "  [ERR] Task registration timed out" Red
+        return
     }
 
-    Start-ScheduledTask -TaskName $TaskName
-    Start-Sleep -Seconds 2
+    Start-ScheduledTask $TaskName
+    Start-Sleep -Seconds 3
+
+    $state = (Get-ScheduledTask -TaskName $TaskName).State
+    Write-Line ""
+
+    if ($state -eq "Running") {
+        Write-Line "  [ OK ] Task is running under SYSTEM" Green
+        Write-Line "  [ OK ] Timer resolution locked to 0.5ms" Green
+        Write-Line "  [ OK ] Re-apply every 30s | Auto-restart on crash" Green
+        Write-Line "  [ !! ] Reboot recommended for full effect" Yellow
+    } else {
+        Write-Line "  [WARN] Task state: $state" Yellow
+        Write-Line "         Check log: $LogPath" Yellow
+    }
+
+    Write-Line ""
+    [void](Read-Host "  Press Enter to return")
 }
 
-function Show-Status {
-    Write-Title "หน้าสถานะระบบ"
+# -- Status --
 
+function Show-Status {
+    Draw-Frame "System Status"
+    Write-Line ""
+
+    # Task info
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     $info = $null
     if ($task) {
-        try {
-            $info = Get-ScheduledTaskInfo -TaskName $TaskName
-        }
-        catch {
-            $info = $null
-        }
+        try { $info = Get-ScheduledTaskInfo -TaskName $TaskName } catch {}
     }
 
-    $author = "N/A"
-    $desc = "N/A"
-    if ($task) {
-        if (-not [string]::IsNullOrWhiteSpace($task.Author)) {
-            $author = $task.Author
-        }
-        if (-not [string]::IsNullOrWhiteSpace($task.Description)) {
-            $desc = $task.Description
-        }
-    }
+    Write-Line "  Scheduled Task" Cyan
+    Write-Host ("  - Name        : {0}" -f $TaskName) -ForegroundColor White
 
-    Write-Section "ข้อมูล Scheduled Task"
-    Write-Info ("- TaskName          : {0}" -f $TaskName)
     if ($task) {
-        Write-Info ("- State             : {0}" -f $task.State)
-        Write-Info ("- Author            : {0}" -f $author)
-        Write-Info ("- TaskPath          : {0}" -f $task.TaskPath)
-        Write-Info ("- Description       : {0}" -f $desc)
-    }
-    else {
-        Write-Warn "- State             : ไม่พบงาน"
+        $stateColor = if ($task.State -eq "Running") { [ConsoleColor]::Green } else { [ConsoleColor]::Yellow }
+        Write-Host "  - State       : " -NoNewline -ForegroundColor White
+        Write-Host $task.State -ForegroundColor $stateColor
+    } else {
+        Write-Host "  - State       : Not installed" -ForegroundColor Yellow
     }
 
     if ($info) {
-        Write-Info ("- LastRunTime       : {0}" -f $info.LastRunTime)
-        Write-Info ("- NextRunTime       : {0}" -f $info.NextRunTime)
-        Write-Info ("- LastTaskResult    : {0}" -f $info.LastTaskResult)
-        Write-Info ("- MissedRuns        : {0}" -f $info.NumberOfMissedRuns)
+        Write-Host ("  - Last Run    : {0}" -f $info.LastRunTime)    -ForegroundColor White
+        Write-Host ("  - Last Result : {0}" -f $info.LastTaskResult) -ForegroundColor White
     }
 
-    Write-Section "สถานะ Timer"
-    $workerPid = Get-WorkerPidFromLog
-    $overall = Get-OverallStatus
+    # Worker process check via PID from log
+    Write-Line ""
+    Write-Line "  Timer Resolution" Cyan
 
-    Write-Info ("- Worker PID        : {0}" -f $(if ($null -ne $workerPid) { $workerPid } else { "ไม่พบใน log" }))
-    Write-Info ("- Worker Alive      : {0}" -f $overall.WorkerAlive)
-    Write-Info ("- Task Running      : {0}" -f $overall.TaskRunning)
-    Write-Info ("- System Resolution  : {0} ms" -f $(if ($null -ne $overall.SystemMs) { $overall.SystemMs } else { "อ่านไม่ได้" }))
+    $wpid     = Get-WorkerPid
+    $procAlive = $false
 
-    switch ($overall.Status) {
-        "ACTIVE" {
-            Write-Ok ("- Overall Status    : {0}" -f $overall.Status)
-        }
-        "DEGRADED" {
-            Write-Warn ("- Overall Status    : {0} (worker ยังรัน แต่ system resolution ไม่ถึง 0.5ms)" -f $overall.Status)
-        }
-        "EXTERNAL SOURCE" {
-            Write-Warn ("- Overall Status    : {0} (มี process อื่นถือ 0.5ms อยู่)" -f $overall.Status)
-        }
-        default {
-            Write-Bad ("- Overall Status    : {0}" -f $overall.Status)
-        }
+    if ($wpid) {
+        $procAlive = [bool](Get-Process -Id $wpid -ErrorAction SilentlyContinue)
+        Write-Host ("  - Worker PID  : {0} ({1})" -f $wpid, $(if ($procAlive) { "alive" } else { "gone" })) -ForegroundColor $(if ($procAlive) { "Green" } else { "Yellow" })
+    } else {
+        Write-Host "  - Worker PID  : Not found in log" -ForegroundColor Yellow
     }
 
-    Write-Section "สถานะไฟล์"
-    Write-Info ("- Script Exists     : {0}" -f (Test-Path $WorkerPath))
-    Write-Info ("- Log Exists        : {0}" -f (Test-Path $LogPath))
+    $systemMs = Get-SystemTimerMs
+    $msText   = if ($null -ne $systemMs) { "$systemMs ms" } else { "Unable to read" }
+    Write-Host ("  - System Value: {0}" -f $msText) -ForegroundColor White
 
+    # 3-state overall status
+    $isLow       = ($null -ne $systemMs -and $systemMs -le 0.5)
+    $workerAlive = $procAlive -or ($task -and $task.State -eq "Running" -and -not $wpid)
+
+    Write-Line ""
+    Write-Host "  - Overall     : " -NoNewline -ForegroundColor White
+
+    if ($workerAlive -and $isLow) {
+        Write-Host "ACTIVE" -ForegroundColor Green
+    } elseif ($workerAlive -and -not $isLow) {
+        Write-Host "DEGRADED  (worker running but resolution not at 0.5ms)" -ForegroundColor Yellow
+    } elseif (-not $workerAlive -and $isLow) {
+        Write-Host "EXTERNAL SOURCE  (0.5ms held by another process)" -ForegroundColor DarkYellow
+    } else {
+        Write-Host "NOT RUNNING" -ForegroundColor Red
+    }
+
+    # Recent log
+    Write-Line ""
+    Write-Line "  Recent Log" Cyan
+    Write-Host "  +----------------------------------------------------------------+" -ForegroundColor DarkCyan
     if (Test-Path $LogPath) {
-        Write-Section "บันทึกล่าสุด"
-        Get-Content -Path $LogPath -Tail 12 -ErrorAction SilentlyContinue
+        Get-Content $LogPath -Tail 10 | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+    } else {
+        Write-Host "  (log file not found)" -ForegroundColor DarkGray
     }
+    Write-Host "  +----------------------------------------------------------------+" -ForegroundColor DarkCyan
 
-    Pause-Menu
+    Write-Line ""
+    [void](Read-Host "  Press Enter to return")
 }
 
-function Stop-TaskAndWait {
-    if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
-        return
-    }
-
-    try {
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    }
-    catch {
-    }
-
-    for ($i = 0; $i -lt 10; $i++) {
-        $state = (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).State
-        if ($state -ne "Running") {
-            break
-        }
-        Start-Sleep -Seconds 1
-    }
-}
+# -- Uninstall --
 
 function Uninstall-Task {
-    Write-Title "ถอนการติดตั้ง"
+    Draw-Frame "Uninstall"
+    Write-Line ""
+    Write-Line "  Type CONFIRM to uninstall everything, or press Enter to cancel:" Yellow
+    $input = Read-Host "  >"
 
-    $confirm = Read-Host "พิมพ์คำว่า ถอน เพื่อยืนยัน"
-    if ($confirm -ne "ถอน") {
-        Write-Warn "ยกเลิกการถอนการติดตั้ง"
+    if ($input -ne "CONFIRM") {
+        Write-Line ""
+        Write-Line "  Cancelled." DarkGray
         Start-Sleep -Seconds 1
         return
     }
 
-    Stop-TaskAndWait
-
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        try { Stop-ScheduledTask $TaskName -ErrorAction SilentlyContinue } catch {}
+
+        # Poll until task stops before deleting files
+        for ($i = 0; $i -lt 10; $i++) {
+            $s = (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).State
+            if ($s -ne "Running") { break }
+            Start-Sleep -Seconds 1
+        }
+
+        Unregister-ScheduledTask $TaskName -Confirm:$false
+        Write-Line "  [+] Task removed" Cyan
+    } else {
+        Write-Line "  [-] Task not found" DarkGray
     }
 
-    if (Test-Path $WorkerPath) {
-        Remove-Item -Path $WorkerPath -Force -ErrorAction SilentlyContinue
-    }
+    if (Test-Path $Script)  { Remove-Item $Script  -Force -ErrorAction SilentlyContinue; Write-Line "  [+] Worker script deleted" Cyan }
+    if (Test-Path $LogPath) { Remove-Item $LogPath -Force -ErrorAction SilentlyContinue; Write-Line "  [+] Log file deleted" Cyan }
 
-    if (Test-Path $LogPath) {
-        Remove-Item -Path $LogPath -Force -ErrorAction SilentlyContinue
-    }
-
-    Write-Ok "ถอนการติดตั้งและล้างไฟล์เรียบร้อย"
-    Start-Sleep -Seconds 1
-}
-
-function Start-TaskNow {
-    if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
-        throw "ยังไม่ได้ติดตั้งงานนี้"
-    }
-
-    Start-ScheduledTask -TaskName $TaskName
+    Write-Line ""
+    Write-Line "  [ OK ] Uninstall complete." Green
     Start-Sleep -Seconds 2
 }
 
-function Show-Menu {
-    Write-Title "ระบบตั้งค่า Timer Resolution 0.5ms"
-
-    Write-Host "  [1] ติดตั้งและเริ่มใช้งาน" -ForegroundColor Green
-    Write-Host "  [2] ตรวจสอบสถานะ" -ForegroundColor Cyan
-    Write-Host "  [3] ถอนการติดตั้ง" -ForegroundColor Red
-    Write-Host "  [4] ออก" -ForegroundColor DarkGray
-    Write-Host ""
-}
-
-if (-not (Test-Admin)) {
-    throw "กรุณาเปิด PowerShell ด้วยสิทธิ์ผู้ดูแลระบบ"
-}
+# -- Main loop --
 
 while ($true) {
-    Show-Menu
-    $choice = Read-Host "เลือกหมายเลข"
+    Draw-Menu
+    $choice = Read-Host "  Select"
+
+    Draw-Menu -Selected $choice
+    Start-Sleep -Milliseconds 200
 
     switch ($choice) {
-        "1" {
-            Write-Title "กำลังติดตั้ง"
-            Write-Info "กำลังสร้าง worker script และ Scheduled Task..."
-            Install-Task
-            Write-Ok "ติดตั้งและเริ่มทำงานแล้ว"
-            Start-Sleep -Seconds 1
-        }
+        "1" { Install-Task }
         "2" { Show-Status }
         "3" { Uninstall-Task }
-        "4" { break }
+        "4" { Clear-Host; exit 0 }
         default {
-            Write-Warn "กรุณาเลือก 1-4"
+            Write-Line "  Please select 1-4" Yellow
             Start-Sleep -Seconds 1
         }
     }
